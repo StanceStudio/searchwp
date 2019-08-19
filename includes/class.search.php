@@ -273,13 +273,24 @@ class SearchWPSearch {
 
 			do_action( 'searchwp_log', '$terms = ' . var_export( $terms, true ) );
 
-			if ( 'DESC' != strtoupper( apply_filters( 'searchwp_search_query_order', $args['order'] ) ) && 'ASC' != strtoupper( $args['order'] ) ) {
+			$args['order'] = strtoupper( apply_filters( 'searchwp_search_query_order', $args['order'] ) );
+			if ( 'DESC' != $args['order'] && 'ASC' != $args['order'] ) {
 				$args['order'] = 'DESC';
 			}
 
 			if ( apply_filters( 'searchwp_query_allow_query_string_override_order', true ) ) {
 				if ( ! empty( $_GET['order'] ) ) {
 					$args['order'] = 'ASC' == strtoupper( $_GET['order'] ) ? 'ASC' : 'DESC';
+				}
+			}
+
+			$lenient_accents = apply_filters( 'searchwp_lenient_accents', false );
+			$lenient_accents_on_search = apply_filters( 'searchwp_lenient_accents_on_search', true );
+
+			if ( $lenient_accents && $lenient_accents_on_search && ! empty( $terms ) ) {
+				$accent_indexer = new SearchWPIndexer();
+				foreach ( $terms as $term_key => $term ) {
+					$terms[ $term_key ] = $accent_indexer->remove_accents( $term );
 				}
 			}
 
@@ -724,6 +735,7 @@ class SearchWPSearch {
 		add_filter( 'searchwp_force_wp_query', '__return_true' ); // we're going to be firing a WP_Query and want it to finish
 
 		$limited_ids = false;
+
 		foreach ( $this->engineSettings as $postType => $postTypeWeights ) {
 
 			if ( $postType !== $post_type || empty( $postTypeWeights['enabled'] ) ) {
@@ -1852,15 +1864,19 @@ class SearchWPSearch {
 		$comment_weight = absint( $args['comment_weight'] );
 		$excerpt_weight = absint( $args['excerpt_weight'] );
 
+		$wrap_core_weights  = apply_filters( 'searchwp_weight_mods_wrap_core_weights', false );
+		$core_weight_prefix = $wrap_core_weights ? '(' : '';
+		$core_weight_suffix = $wrap_core_weights ? ')' : '';
+
 		$this->sql .= "
             LEFT JOIN (
                 SELECT {$wpdb->prefix}posts.{$post_column} AS post_id,
-                    ( SUM( {$this->db_prefix}index.title ) * {$title_weight} ) +
+                    {$core_weight_prefix}( SUM( {$this->db_prefix}index.title ) * {$title_weight} ) +
                     ( SUM( {$this->db_prefix}index.slug ) * {$slug_weight} ) +
                     ( SUM( {$this->db_prefix}index.content ) * {$content_weight} ) +
                     ( SUM( {$this->db_prefix}index.comment ) * {$comment_weight} ) +
                     ( SUM( {$this->db_prefix}index.excerpt ) * {$excerpt_weight} ) +
-                    {$args['custom_fields']} + {$args['taxonomies']}";
+                    {$args['custom_fields']} + {$args['taxonomies']}{$core_weight_suffix}";
 
 		// allow developers to inject their own weight modifications
 		$this->sql .= apply_filters( 'searchwp_weight_mods', '', array(
@@ -2309,7 +2325,7 @@ class SearchWPSearch {
 					// TODO: store our post format clause and integrate
 					// TODO: store our post status clause and integrate
 
-					// prep the term
+					// prep the term for this combination of term and post type config
 					$prepped_term           = $this->prep_term( $term, $postTypeWeights );
 					$term                   = $prepped_term['term'];
 					$term_or_stem           = $prepped_term['term_or_stem'];
@@ -2320,6 +2336,7 @@ class SearchWPSearch {
 					if ( ! in_array( $term_or_stem, array( 'term', 'stem' ) ) ) {
 						wp_die( 'Invalid request', 'searchwp' );
 					}
+
 					$this->sql_term_where = " {$this->db_prefix}terms." . $term_or_stem . ' IN (' . implode( ',', $term ) . ')';
 					/** @noinspection PhpUnusedLocalVariableInspection */
 					$last_term = $term;
@@ -2347,11 +2364,38 @@ class SearchWPSearch {
 
 					// Take into consideration the engine limiter rules FOR THIS POST TYPE
 					$limited_ids = $this->get_included_ids_from_taxonomies_for_post_type( $postType );
+					$limiter_column = 'ID';
+
+					// If parent attribution is in play we need to transfer the inclusion/exclusion rules
+					if (
+						'attachment' === $postType
+						&& isset( $postTypeWeights['options']['parent'] )
+						&& ! empty( $postTypeWeights['options']['parent'] )
+					) {
+						$limiter_column = 'post_parent';
+						$global_limited_ids = array();
+
+						// This isn't ideal because the post_parent can be _any_ post type, so we need to limit to them all...
+						foreach ( $this->engineSettings as $limiter_post_type => $limiter_post_type_weights ) {
+							if ( ! isset( $limiter_post_type_weights['enabled'] ) || empty( $limiter_post_type_weights['enabled'] ) ) {
+								continue;
+							}
+
+							$these_limited_ids = $this->get_included_ids_from_taxonomies_for_post_type( $limiter_post_type );
+
+							if ( ! empty( $these_limited_ids ) ) {
+								$global_limited_ids = array_merge( $global_limited_ids, $these_limited_ids );
+							}
+						}
+
+						$limited_ids = array_unique( $global_limited_ids );
+					}
+
 					// Function returns false if not applicable
 					if ( is_array( $limited_ids ) && ! empty( $limited_ids ) ) {
 						$limited_ids = array_map( 'absint', $limited_ids );
 						$limited_ids = array_unique( $limited_ids );
-						$this->sql_status .= " AND {$wpdb->prefix}posts.post_type = '{$postType}' AND {$wpdb->prefix}posts.ID IN ( " . implode( ',', $limited_ids ) . ' ) ';
+						$this->sql_status .= " AND {$wpdb->prefix}posts.post_type = '{$postType}' AND {$wpdb->prefix}posts." . $limiter_column . " IN ( " . implode( ',', $limited_ids ) . ' ) ';
 					}
 
 					// reset back to our original term
@@ -2728,6 +2772,25 @@ class SearchWPSearch {
 
 			// if the term was stemmed via the filter use it, else generate our own
 			$term = ( $unstemmed == $maybeStemmed ) ? $this->stemmer->stem( $term ) : $maybeStemmed;
+
+			// It's only a valid stem if the original term is in fact in the index, so let's verify.
+			$validate_stem = apply_filters( 'searchwp_stem_validate', true );
+			if ( $validate_stem ) {
+				$in_index = $wpdb->query(
+					$wpdb->prepare(
+						"
+							SELECT * FROM {$this->db_prefix}terms
+							WHERE stem = %s LIMIT 1
+						",
+						$term
+					)
+				);
+
+				// If it's an invalid stem then we need to revert back to the original, prepped term for additional processing (e.g. partial matches)
+				if ( empty( $in_index ) ) {
+					$term = $original_prepped_term;
+				}
+			}
 		}
 
 		// set up our term operator (e.g. LIKE terms or fuzzy matching)
